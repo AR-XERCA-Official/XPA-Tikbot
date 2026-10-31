@@ -3,32 +3,31 @@ import logging
 import os
 import re
 import sqlite3
-from threading import Lock
+import threading
+from io import BytesIO
 
 import requests
 import telebot
-from telebot import types
-from flask import Flask, abort, jsonify, request
+from flask import Flask, jsonify
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 TIKWM_API = os.getenv("TIKWM_API", "https://www.tikwm.com/api/").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/tmp/tiktok_bot.db")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "48"))
 MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required.")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET environment variable is required.")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tiktok-flask-bot")
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
-db_lock = Lock()
+db_lock = threading.Lock()
+polling_started = False
+polling_lock = threading.Lock()
+
 URL_RE = re.compile(r"https?://(?:www\.)?(?:vm\.)?tiktok\.com/\S+", re.I)
 
 
@@ -53,6 +52,14 @@ def init_db():
                 )
             """)
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending (
+                    user_id INTEGER PRIMARY KEY,
+                    title TEXT,
+                    media_type TEXT,
+                    file_ids TEXT
+                )
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS downloads (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -67,12 +74,12 @@ def init_db():
 
 
 def main_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb = telebot.types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("⭐ المفضلة", callback_data="favorites"),
-        types.InlineKeyboardButton("🕘 سجل التحميلات", callback_data="history"),
+        telebot.types.InlineKeyboardButton("⭐ المفضلة", callback_data="favorites"),
+        telebot.types.InlineKeyboardButton("🕘 سجل التحميلات", callback_data="history"),
     )
-    kb.add(types.InlineKeyboardButton("ℹ️ طريقة الاستخدام", callback_data="help"))
+    kb.add(telebot.types.InlineKeyboardButton("ℹ️ طريقة الاستخدام", callback_data="help"))
     return kb
 
 
@@ -99,8 +106,7 @@ def download_bytes(url):
         declared = response.headers.get("Content-Length")
         if declared and int(declared) > MAX_DOWNLOAD_BYTES:
             raise RuntimeError("حجم الملف أكبر من الحد المسموح.")
-        chunks = []
-        total = 0
+        chunks, total = [], 0
         for chunk in response.iter_content(64 * 1024):
             if not chunk:
                 continue
@@ -137,12 +143,8 @@ def remember_favorite(user_id, title, media_type, file_ids):
             conn.close()
 
 
-def get_title(data):
-    return (data.get("title") or "TikTok media").strip()[:900]
-
-
 def send_download(message, data):
-    title = get_title(data)
+    title = (data.get("title") or "TikTok media").strip()[:900]
     images = data.get("images") or []
     file_ids = []
     media_type = ""
@@ -158,33 +160,25 @@ def send_download(message, data):
                     photo_urls.append(candidate[0])
                 elif isinstance(candidate, str):
                     photo_urls.append(candidate)
-
         if not photo_urls:
             raise RuntimeError("لم أجد روابط الصور في استجابة Tikwm.")
         media_type = "photos"
-        sent_messages = []
         for index, photo_url in enumerate(photo_urls):
-            binary = download_bytes(photo_url)
-            from io import BytesIO
-            photo = BytesIO(binary)
+            photo = BytesIO(download_bytes(photo_url))
             photo.name = f"tiktok_{index + 1}.jpg"
             sent = bot.send_photo(
                 message.chat.id,
                 photo,
                 caption=title[:1024] if index == 0 else None,
             )
-            sent_messages.append(sent)
             if sent.photo:
                 file_ids.append(sent.photo[-1].file_id)
     else:
         video_url = data.get("play") or data.get("hdplay") or data.get("wmplay")
         audio_url = data.get("music")
-        from io import BytesIO
-
         if video_url:
             media_type = "video"
-            binary = download_bytes(video_url)
-            media = BytesIO(binary)
+            media = BytesIO(download_bytes(video_url))
             media.name = "tiktok.mp4"
             sent = bot.send_video(
                 message.chat.id, media, caption=title[:1024], supports_streaming=True
@@ -192,8 +186,7 @@ def send_download(message, data):
             file_ids = [sent.video.file_id]
         elif audio_url:
             media_type = "audio"
-            binary = download_bytes(audio_url)
-            media = BytesIO(binary)
+            media = BytesIO(download_bytes(audio_url))
             media.name = "tiktok_audio.mp3"
             sent = bot.send_audio(message.chat.id, media, title=title[:64])
             file_ids = [sent.audio.file_id]
@@ -201,22 +194,9 @@ def send_download(message, data):
             raise RuntimeError("لم أجد فيديو أو صوراً أو صوتاً لهذا الرابط.")
 
     save_download(message.from_user.id, title, media_type)
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("⭐ أضف إلى المفضلة", callback_data="save"))
-    bot.send_message(message.chat.id, "تم التحميل بنجاح. ✨", reply_markup=markup)
-
-    # The pending item is stored in SQLite to survive web worker restarts.
     with db_lock:
         conn = connect_db()
         try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS pending (
-                    user_id INTEGER PRIMARY KEY,
-                    title TEXT,
-                    media_type TEXT,
-                    file_ids TEXT
-                )
-            """)
             conn.execute(
                 """INSERT INTO pending(user_id,title,media_type,file_ids)
                    VALUES(?,?,?,?)
@@ -227,6 +207,10 @@ def send_download(message, data):
             conn.commit()
         finally:
             conn.close()
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("⭐ أضف إلى المفضلة", callback_data="save"))
+    bot.send_message(message.chat.id, "تم التحميل بنجاح. ✨", reply_markup=markup)
 
 
 @bot.message_handler(commands=["start"])
@@ -249,13 +233,8 @@ def help_command(message):
         "2) أرسله هنا.\n"
         "3) سيحاول البوت إرسال الفيديو أو الصور المتاحة.\n\n"
         "الأوامر: /start — /favorites — /history\n"
-        "الصوت يُتاح حسب الحقول التي يرجعها Tikwm API.",
+        "الصوت متاح حسب ما يرجعه Tikwm API.",
     )
-
-
-@bot.message_handler(commands=["favorites"])
-def favorites_command(message):
-    show_favorites(message.chat.id, message.from_user.id)
 
 
 def show_favorites(chat_id, user_id):
@@ -268,17 +247,21 @@ def show_favorites(chat_id, user_id):
             ).fetchall()
         finally:
             conn.close()
-
     if not rows:
         bot.send_message(chat_id, "⭐ لا توجد عناصر في المفضلة بعد.")
         return
-    markup = types.InlineKeyboardMarkup()
+    markup = telebot.types.InlineKeyboardMarkup()
     for row in rows:
-        markup.add(types.InlineKeyboardButton(
+        markup.add(telebot.types.InlineKeyboardButton(
             f"⭐ {(row['title'] or 'محتوى')[:35]}",
             callback_data=f"favopen:{row['id']}",
         ))
     bot.send_message(chat_id, "مفضلتك:", reply_markup=markup)
+
+
+@bot.message_handler(commands=["favorites"])
+def favorites_command(message):
+    show_favorites(message.chat.id, message.from_user.id)
 
 
 @bot.message_handler(commands=["history"])
@@ -302,7 +285,7 @@ def history_command(message):
     bot.send_message(message.chat.id, "\n".join(lines))
 
 
-@bot.message_handler(func=lambda m: bool(m.text))
+@bot.message_handler(func=lambda message: bool(message.text))
 def handle_text(message):
     match = URL_RE.search(message.text.strip())
     if not match:
@@ -326,8 +309,7 @@ def handle_text(message):
 @bot.callback_query_handler(func=lambda call: True)
 def callbacks(call):
     data = call.data or ""
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
+    user_id, chat_id = call.from_user.id, call.message.chat.id
 
     if data == "help":
         bot.answer_callback_query(call.id)
@@ -337,9 +319,23 @@ def callbacks(call):
         show_favorites(chat_id, user_id)
     elif data == "history":
         bot.answer_callback_query(call.id)
-        fake_message = call.message
-        fake_message.from_user = call.from_user
-        history_command(fake_message)
+        with db_lock:
+            conn = connect_db()
+            try:
+                rows = conn.execute(
+                    "SELECT title,media_type,created_at FROM downloads "
+                    "WHERE user_id=? ORDER BY id DESC LIMIT 10",
+                    (user_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+        if not rows:
+            bot.send_message(chat_id, "سجل التحميلات فارغ حالياً.")
+        else:
+            bot.send_message(chat_id, "\n".join(
+                ["🕘 آخر التحميلات:"] +
+                [f"• {r['title'] or 'بدون عنوان'} — {r['media_type']} ({r['created_at']})" for r in rows]
+            ))
     elif data == "save":
         with db_lock:
             conn = connect_db()
@@ -380,8 +376,8 @@ def callbacks(call):
             elif row["media_type"] == "audio":
                 bot.send_audio(chat_id, ids[0], title=(row["title"] or "")[:64])
             else:
-                for fid in ids:
-                    bot.send_photo(chat_id, fid)
+                for file_id in ids:
+                    bot.send_photo(chat_id, file_id)
             bot.answer_callback_query(call.id, "تم إرسال العنصر.")
         except Exception:
             bot.answer_callback_query(call.id, "تعذر إعادة إرسال العنصر.", show_alert=True)
@@ -389,26 +385,33 @@ def callbacks(call):
 
 @app.get("/")
 def health():
-    return jsonify({"status": "ok", "service": "TikTok Telegram Bot"}), 200
+    return jsonify({"status": "ok", "service": "TikTok Telegram Bot", "mode": "polling"}), 200
 
 
-@app.post("/webhook/" + WEBHOOK_SECRET)
-def telegram_webhook():
-    if not request.is_json:
-        abort(400)
-    update = telebot.types.Update.de_json(request.get_json(force=True))
-    bot.process_new_updates([update])
-    return "OK", 200
+def start_polling():
+    global polling_started
+    with polling_lock:
+        if polling_started:
+            return
+        polling_started = True
 
+    def runner():
+        try:
+            # Remove any old webhook so long polling can receive updates.
+            bot.delete_webhook(drop_pending_updates=False)
+            log.info("Starting Telegram long polling")
+            bot.infinity_polling(
+                timeout=25,
+                long_polling_timeout=20,
+                skip_pending=False,
+                allowed_updates=["message", "callback_query"],
+            )
+        except Exception:
+            log.exception("Telegram polling stopped")
 
-def configure_webhook():
-    if WEBHOOK_URL:
-        target = f"{WEBHOOK_URL}/webhook/{WEBHOOK_SECRET}"
-        result = bot.set_webhook(url=target, drop_pending_updates=False)
-        log.info("Webhook configured: %s", result)
-    else:
-        log.warning("WEBHOOK_URL is empty; set it to your Render service URL.")
+    thread = threading.Thread(target=runner, name="telegram-polling", daemon=True)
+    thread.start()
 
 
 init_db()
-configure_webhook()
+start_polling()

@@ -9,15 +9,3 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: WEBHOOK_URL
-        sync: false
-      - key: WEBHOOK_SECRET
-        generateValue: true
-      - key: TIKWM_API
-        value: https://www.tikwm.com/api/
-      - key: DATABASE_PATH
-        value: /var/data/bot.db
-    disk:
-      name: bot-data
-      mountPath: /var/data
-      sizeGB: 1
