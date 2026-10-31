@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tiktok-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: TIKWM_API
+        value: https://www.tikwm.com/api/
+      - key: DATABASE_PATH
+        value: /var/data/bot.db
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
