@@ -28,7 +28,10 @@ db_lock = threading.Lock()
 polling_started = False
 polling_lock = threading.Lock()
 
-URL_RE = re.compile(r"https?://(?:www\.)?(?:vm\.)?tiktok\.com/\S+", re.I)
+URL_RE = re.compile(
+    r"https?://(?:www\.|vt\.|vm\.)?tiktok\.com/\S+",
+    re.I
+)
 
 
 def connect_db():
